@@ -6,8 +6,11 @@ use {
         packet::{
             arp::ArpPacket,
             ethernet::{EtherType, EthernetPacket, MutableEthernetPacket},
+            ip::IpNextHeaderProtocol,
             ipv4::{checksum, MutableIpv4Packet},
             ipv6::MutableIpv6Packet,
+            tcp::{self, MutableTcpPacket},
+            udp::{self, MutableUdpPacket},
             MutablePacket,
         },
     },
@@ -19,6 +22,8 @@ use {
 
 const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86DD;
+const TCP: u8 = 0x06;
+const UDP: u8 = 0x11;
 
 pub struct PacketSender {
     netif: NetworkInterface,
@@ -30,6 +35,40 @@ pub struct PacketSender {
 }
 
 impl PacketSender {
+    fn recalculate_ipv4_l4_checksum(packet: &mut MutableIpv4Packet) {
+        match packet.get_next_level_protocol() {
+            IpNextHeaderProtocol(TCP) => {
+                let (src_addr, dst_addr) = (packet.get_source(), packet.get_destination());
+                let mut tcp_packet = MutableTcpPacket::new(packet.payload_mut()).unwrap();
+                let checksum = tcp::ipv4_checksum(&tcp_packet.to_immutable(), &src_addr, &dst_addr);
+                tcp_packet.set_checksum(checksum);
+            }
+            IpNextHeaderProtocol(UDP) => {
+                let (src_addr, dst_addr) = (packet.get_source(), packet.get_destination());
+                let mut udp_packet = MutableUdpPacket::new(packet.payload_mut()).unwrap();
+                let checksum = udp::ipv4_checksum(&udp_packet.to_immutable(), &src_addr, &dst_addr);
+                udp_packet.set_checksum(checksum);
+            }
+            _ => {}
+        }
+    }
+    fn recalculate_ipv6_l4_checksum(packet: &mut MutableIpv6Packet) {
+        match packet.get_next_header() {
+            IpNextHeaderProtocol(TCP) => {
+                let (src_addr, dst_addr) = (packet.get_source(), packet.get_destination());
+                let mut tcp_packet = MutableTcpPacket::new(packet.payload_mut()).unwrap();
+                let checksum = tcp::ipv6_checksum(&tcp_packet.to_immutable(), &src_addr, &dst_addr);
+                tcp_packet.set_checksum(checksum);
+            }
+            IpNextHeaderProtocol(UDP) => {
+                let (src_addr, dst_addr) = (packet.get_source(), packet.get_destination());
+                let mut udp_packet = MutableUdpPacket::new(packet.payload_mut()).unwrap();
+                let checksum = udp::ipv6_checksum(&udp_packet.to_immutable(), &src_addr, &dst_addr);
+                udp_packet.set_checksum(checksum);
+            }
+            _ => {}
+        }
+    }
     pub fn open(netif_name: &str) -> Result<Self, String> {
         let netif = interfaces()
             .into_iter()
@@ -91,12 +130,14 @@ impl PacketSender {
                         new_ip_packet.set_source(ipv4_addr);
                         let checksum = checksum(&new_ip_packet.to_immutable());
                         new_ip_packet.set_checksum(checksum);
+                        Self::recalculate_ipv4_l4_checksum(&mut new_ip_packet);
                     }
                     (EtherType(ETHER_TYPE_IPV6), _, Some(ipv6_addr)) => {
                         // IPV6
                         let mut new_ip_packet =
                             MutableIpv6Packet::new(&mut new_packet[14..]).unwrap();
                         new_ip_packet.set_source(ipv6_addr);
+                        Self::recalculate_ipv6_l4_checksum(&mut new_ip_packet);
                     }
                     _ => {}
                 }
