@@ -1,4 +1,5 @@
 mod host;
+mod mac;
 mod packet;
 mod state;
 
@@ -6,6 +7,7 @@ use {
     env_logger,
     log::{debug, error, info, LevelFilter},
     once_cell::sync::OnceCell,
+    packet::PacketSender,
     parking_lot::{Mutex, RwLock},
     rawsock::{
         self,
@@ -41,11 +43,12 @@ type TimerArgs = (Host, Instant);
 const WAIT_PERIOD: Duration = Duration::from_secs(2);
 const MAIN_OUTBOUND_FILTER: &str = "ip or ip6";
 const MAIN_INBOUND_FILTER: &str = "ip or ip6";
-const SIDE_INBOUND_FILTER: &str = "ip or ip6";
+const SIDE_INBOUND_FILTER: &str = "ip or ip6 or arp";
 
 static OPT: OnceCell<Cli> = OnceCell::new();
-static LIB: OnceCell<pcap::Library> = OnceCell::new();
 static STATES: OnceCell<RwLock<HashMap<Host, Mutex<state::State>>>> = OnceCell::new();
+static SIDE_SENDER: OnceCell<Mutex<PacketSender>> = OnceCell::new();
+pub static LIB: OnceCell<pcap::Library> = OnceCell::new();
 
 fn handle_main_outbound_packets(
     main_netif: &str,
@@ -63,8 +66,12 @@ fn handle_main_outbound_packets(
     main_netif
         .set_direction(Direction::Out)
         .expect("Cannot set main outbound direction");
-    let mut side_sender =
-        packet::PacketSender::open(side_netif).expect("Cannot open side interface sender");
+    SIDE_SENDER
+        .set(Mutex::new(
+            PacketSender::open(side_netif).expect("Cannot open side interface sender"),
+        ))
+        .map_err(|_| ())
+        .unwrap();
     loop {
         let packet = if let Ok(packet) = main_netif.receive() {
             packet
@@ -80,10 +87,8 @@ fn handle_main_outbound_packets(
                 packet.len() >= 14,
                 "Packet length should be greater than 14 bytes"
             );
-            let mut test_packet = packet.into_owned();
-            let (left, right) = test_packet.split_at_mut(6);
-            left.swap_with_slice(&mut right[0..6]);
-            match side_sender.send(&test_packet) {
+            let test_packet = packet.into_owned();
+            match SIDE_SENDER.get().unwrap().lock().send(&test_packet) {
                 Ok(()) => {
                     timer_tx.send((host, Instant::now())).unwrap();
                 }
@@ -147,11 +152,20 @@ fn handle_side_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
             // debug!("Skipped one packet in main outbound");
             continue;
         };
-        let host = Host::src_from_packet(&packet);
-        let states = STATES.get().unwrap().read();
-        if let Some(state) = states.get(&host) {
-            if State::Pending == *state.lock() {
-                state_tx.send((host, State::KnownProxy)).unwrap();
+        if (packet[12], packet[13]) == (0x08, 0x06) {
+            // arp response
+            SIDE_SENDER
+                .get()
+                .unwrap()
+                .lock()
+                .update_dst_hw_from_packet(&packet);
+        } else {
+            let host = Host::src_from_packet(&packet);
+            let states = STATES.get().unwrap().read();
+            if let Some(state) = states.get(&host) {
+                if State::Pending == *state.lock() {
+                    state_tx.send((host, State::KnownProxy)).unwrap();
+                }
             }
         }
     }
