@@ -4,7 +4,6 @@ use {
     pnet::{
         datalink::{channel, interfaces, Channel, DataLinkSender, MacAddr, NetworkInterface},
         packet::{
-            arp::ArpPacket,
             ethernet::{EtherType, EthernetPacket, MutableEthernetPacket},
             ip::IpNextHeaderProtocol,
             ipv4::{checksum, MutableIpv4Packet},
@@ -146,8 +145,8 @@ impl PacketSender {
     }
 
     pub fn update_dst_hw_from_packet(&mut self, ether_packet: &[u8]) {
-        ArpPacket::new(ether_packet).map(|ether_packet| {
-            self.dst_mac = ether_packet.get_sender_hw_addr();
+        EthernetPacket::new(ether_packet).map(|ether_packet| {
+            self.dst_mac = Some(ether_packet.get_source());
         });
     }
 }
