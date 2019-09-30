@@ -50,7 +50,7 @@ fn get_arp_entries(netif_name: &str) -> Vec<ArpEntry> {
     ret
 }
 
-pub fn get_dst_address_by_netif_name(netif_name: &str) -> MacAddr {
+pub fn get_dst_address_by_netif_name(netif_name: &str) -> Option<MacAddr> {
     let netif = LIB
         .get()
         .unwrap()
@@ -68,6 +68,5 @@ pub fn get_dst_address_by_netif_name(netif_name: &str) -> MacAddr {
                 .iter()
                 .any(|addr| addr.address.map_or(false, |addr| addr.ip() != arp.ip_addr))
         })
-        .unwrap()
-        .hw_addr
+        .map(|addr| addr.hw_addr)
 }

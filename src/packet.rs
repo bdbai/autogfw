@@ -10,7 +10,7 @@ use {
             ipv6::MutableIpv6Packet,
             tcp::{self, MutableTcpPacket},
             udp::{self, MutableUdpPacket},
-            MutablePacket,
+            MutablePacket, Packet,
         },
     },
     std::{
@@ -23,11 +23,13 @@ const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86DD;
 const TCP: u8 = 0x06;
 const UDP: u8 = 0x11;
+const IPV4_VERSION: u8 = 0x45;
+const IPV6_VERSION: u8 = 0x60; // higher 4 bits only
 
 pub struct PacketSender {
     netif: NetworkInterface,
-    src_mac: MacAddr,
-    dst_mac: MacAddr,
+    src_mac: Option<MacAddr>,
+    dst_mac: Option<MacAddr>,
     ipv4_addr: Option<Ipv4Addr>,
     ipv6_addr: Option<Ipv6Addr>,
     channel: Option<Box<dyn DataLinkSender>>,
@@ -73,7 +75,7 @@ impl PacketSender {
             .into_iter()
             .find(|netif| netif.name == netif_name)
             .ok_or_else(|| "Cannot find network interface ".to_string() + netif_name)?;
-        let src_mac = netif.mac.expect("Cannot find MAC address");
+        let src_mac = netif.mac;
         let ipv4_addr = netif.ips.iter().find_map(|ip| {
             if let IpNetwork::V4(v4) = ip {
                 Some(v4.ip())
@@ -116,16 +118,28 @@ impl PacketSender {
         self.channel
             .as_mut()
             .unwrap()
-            .build_and_send(1, size, &mut |new_packet| {
-                let mut new_ether_packet = MutableEthernetPacket::new(new_packet).unwrap();
-                new_ether_packet.clone_from(&ether_packet);
-                new_ether_packet.set_source(src_mac);
-                new_ether_packet.set_destination(dst_mac);
-                match (new_ether_packet.get_ethertype(), ipv4_addr, ipv6_addr) {
+            .build_and_send(1, src_mac.map_or(size - 14, |_| size), &mut |new_packet| {
+                let mut packet = new_packet;
+                let ether_type = if let (Some(src_mac), Some(dst_mac)) = (src_mac, dst_mac) {
+                    let mut new_ether_packet = MutableEthernetPacket::new(packet).unwrap();
+                    new_ether_packet.clone_from(&ether_packet);
+                    new_ether_packet.set_source(src_mac);
+                    new_ether_packet.set_destination(dst_mac);
+                    let ether_type = new_ether_packet.get_ethertype();
+                    packet = &mut packet[14..];
+                    ether_type
+                } else {
+                    packet.copy_from_slice(ether_packet.payload());
+                    match packet[0] {
+                        IPV4_VERSION => EtherType(ETHER_TYPE_IPV4),
+                        byte if byte & 0xF0 == IPV6_VERSION => EtherType(ETHER_TYPE_IPV6),
+                        _ => return,
+                    }
+                };
+                match (ether_type, ipv4_addr, ipv6_addr) {
                     (EtherType(ETHER_TYPE_IPV4), Some(ipv4_addr), _) => {
                         // IPV4
-                        let mut new_ip_packet =
-                            MutableIpv4Packet::new(&mut new_packet[14..]).unwrap();
+                        let mut new_ip_packet = MutableIpv4Packet::new(packet).unwrap();
                         new_ip_packet.set_source(ipv4_addr);
                         let checksum = checksum(&new_ip_packet.to_immutable());
                         new_ip_packet.set_checksum(checksum);
@@ -133,8 +147,7 @@ impl PacketSender {
                     }
                     (EtherType(ETHER_TYPE_IPV6), _, Some(ipv6_addr)) => {
                         // IPV6
-                        let mut new_ip_packet =
-                            MutableIpv6Packet::new(&mut new_packet[14..]).unwrap();
+                        let mut new_ip_packet = MutableIpv6Packet::new(packet).unwrap();
                         new_ip_packet.set_source(ipv6_addr);
                         Self::recalculate_ipv6_l4_checksum(&mut new_ip_packet);
                     }
