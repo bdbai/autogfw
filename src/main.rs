@@ -4,8 +4,8 @@ mod packet;
 mod state;
 
 use {
-    env_logger,
-    log::{debug, error, info, LevelFilter},
+    env_logger::{self, Env},
+    log::{debug, error, info},
     once_cell::sync::OnceCell,
     packet::PacketSender,
     parking_lot::{Mutex, RwLock},
@@ -19,6 +19,8 @@ use {
     std::{
         collections::HashMap,
         process::exit,
+        process::Command,
+        str::from_utf8,
         sync::mpsc::{channel, Receiver, Sender},
         thread,
         time::{Duration, Instant},
@@ -32,15 +34,22 @@ struct Cli {
     #[structopt(short = "m", long = "main-netif")]
     main_netif: String,
     /// The side interface (usually VPN) to inspect
-    #[structopt(short = "s")]
+    #[structopt(short = "s", long = "side-netif")]
     side_netif: String,
+    /// Timeout (in seconds)
+    #[structopt(short = "t", long = "timeout", default_value = "2")]
+    timeout: u64,
+    /// The arguments passed to  `ip route replace`.
+    /// Will be appended to `ip route replace $ip_addr`.
+    /// If not specified, routes will not be changed.
+    #[structopt(short = "c", long = "add-args")]
+    route_add_arguments: Option<Vec<String>>,
 }
 
 type Host = host::Host;
 type StateArgs = (Host, state::State);
 type TimerArgs = (Host, Instant);
 
-const WAIT_PERIOD: Duration = Duration::from_secs(2);
 const MAIN_OUTBOUND_FILTER: &str = "ip or ip6";
 const MAIN_INBOUND_FILTER: &str = "ip or ip6";
 const SIDE_INBOUND_FILTER: &str = "ip or ip6 or arp";
@@ -122,13 +131,11 @@ fn handle_main_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
         };
         let host = Host::src_from_packet(&packet);
         let states = STATES.get().unwrap().read();
-        if let Some(state) = states.get(&host) {
-            match *state.lock() {
-                State::KnownProxy | State::Pending | State::TimedOut => {
-                    state_tx.send((host, State::KnownDirect)).unwrap();
-                }
-                _ => {}
-            }
+        if states
+            .get(&host)
+            .map_or(true, |state| *state.lock() != State::KnownDirect)
+        {
+            state_tx.send((host, State::KnownDirect)).unwrap();
         }
     }
 }
@@ -172,11 +179,25 @@ fn handle_side_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
 }
 
 fn state_handler(rx: Receiver<StateArgs>) {
+    let opts = &OPT.get().unwrap();
+    let add_args = &opts.route_add_arguments;
     for (host, next_state) in rx.into_iter() {
         let mut states = STATES.get().unwrap().write();
         if let Some(state) = states.get(&host).map(|s| *s.lock()) {
-            if state == next_state {
-                continue;
+            match (state, next_state) {
+                (_, State::Pending) => {
+                    continue;
+                }
+                (old, new) if old == new => {
+                    continue;
+                }
+                (State::KnownDirect, State::KnownProxy) => {
+                    continue;
+                }
+                (State::KnownDirect, State::TimedOut) | (State::KnownProxy, State::TimedOut) => {
+                    continue;
+                }
+                _ => {}
             }
         }
         debug!(
@@ -187,14 +208,59 @@ fn state_handler(rx: Receiver<StateArgs>) {
         states
             .entry(host)
             .and_modify(|s| *s.lock() = next_state)
-            .or_insert_with(|| Mutex::from(State::Pending));
-        // TODO: execute scripts
+            .or_insert_with(|| Mutex::from(next_state));
+        match (add_args, next_state) {
+            (Some(add_args), State::KnownProxy) => {
+                let output = Command::new("ip")
+                    .arg("route")
+                    .arg("replace")
+                    .arg(host.to_string())
+                    .args(add_args)
+                    .output()
+                    .expect("Error executing ip route replace command");
+                if output.status.success() {
+                    info!("Route replaced: host = {}", host);
+                } else {
+                    error!(
+                        "Error replacing route: host = {}, stdout = {}, stderr = {}",
+                        host,
+                        from_utf8(&output.stdout).unwrap().trim(),
+                        from_utf8(&output.stderr).unwrap().trim()
+                    )
+                }
+            }
+            (Some(_), State::KnownDirect) | (Some(_), State::TimedOut) => {
+                let output = Command::new("ip")
+                    .arg("route")
+                    .arg("delete")
+                    .arg(host.to_string())
+                    .output()
+                    .expect("Error executing ip route delete command");
+                if output.status.success() {
+                    info!("Route deleted: host = {}", host);
+                } else {
+                    let stderr = from_utf8(&output.stderr).unwrap().trim();
+                    if stderr.ends_with("No such process") {
+                        debug!("No such route: host = {}", host);
+                    } else {
+                        error!(
+                            "Error deleting route: host = {}, stdout = {}, stderr = {}",
+                            host,
+                            from_utf8(&output.stdout).unwrap().trim(),
+                            stderr
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
 fn timer_handler(state_tx: Sender<StateArgs>, timer_rx: Receiver<TimerArgs>) {
+    let timeout = Duration::from_secs(OPT.get().unwrap().timeout as u64);
     for (port, fire_time) in timer_rx.into_iter() {
-        WAIT_PERIOD
+        timeout
             .checked_sub(Instant::now().duration_since(fire_time))
             .map(thread::sleep)
             .unwrap_or(());
@@ -208,6 +274,7 @@ fn timer_handler(state_tx: Sender<StateArgs>, timer_rx: Receiver<TimerArgs>) {
 }
 
 fn main() {
+    env_logger::init_from_env(Env::default().default_filter_or("info"));
     let opts = Cli::from_args();
     let main_netif = opts.main_netif.to_string();
     let side_netif = opts.side_netif.to_string();
@@ -221,10 +288,6 @@ fn main() {
     STATES
         .set(RwLock::new(HashMap::with_capacity(1024)))
         .unwrap();
-    env_logger::builder()
-        .filter_module("autogfw", LevelFilter::Debug)
-        .init();
-    info!("Started autogfw");
 
     LIB.set(pcap::Library::open_default_paths().expect("Cannot open pcap lib"))
         .map_err(|_| ())
@@ -250,6 +313,7 @@ fn main() {
         thread::spawn(move || handle_side_inbound_packets(side_netif2.as_str(), state_tx));
     let state_handler_thread = thread::spawn(move || state_handler(state_rx));
     let timer_handler_thread = thread::spawn(move || timer_handler(state_tx3, timer_rx));
+    info!("Started autogfw");
     main_netif_outbound_thread.join().unwrap();
     main_netif_inbound_thread.join().unwrap();
     side_netif_thread.join().unwrap();
