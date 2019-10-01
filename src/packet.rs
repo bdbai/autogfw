@@ -23,8 +23,8 @@ const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86DD;
 const TCP: u8 = 0x06;
 const UDP: u8 = 0x11;
-const IPV4_VERSION: u8 = 0x45;
-const IPV6_VERSION: u8 = 0x60; // higher 4 bits only
+pub const IPV4_VERSION: u8 = 0x45;
+pub const IPV6_VERSION: u8 = 0x60; // higher 4 bits only
 
 pub struct PacketSender {
     netif: NetworkInterface,

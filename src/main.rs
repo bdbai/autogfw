@@ -69,6 +69,7 @@ fn handle_main_outbound_packets(
     let mut main_netif = lib
         .open_interface(main_netif)
         .expect("Cannot open main interface");
+    let data_link = main_netif.data_link();
     main_netif
         .set_filter(MAIN_OUTBOUND_FILTER)
         .expect("Cannot set main outbound filter");
@@ -88,7 +89,11 @@ fn handle_main_outbound_packets(
             // debug!("Skipped one packet in main outbound");
             continue;
         };
-        let host = Host::dst_from_packet(&packet);
+        let host = if let Some(host) = Host::dst_from_packet(&packet, data_link) {
+            host
+        } else {
+            continue;
+        };
         let states = STATES.get().unwrap().read();
         if states.get(&host).is_none() {
             state_tx.send((host, State::Pending)).unwrap();
@@ -116,6 +121,7 @@ fn handle_main_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
         .unwrap()
         .open_interface(netif)
         .expect("Cannot open main interface");
+    let data_link = netif.data_link();
     netif
         .set_filter(MAIN_INBOUND_FILTER)
         .expect("Cannot set main inbound filter");
@@ -129,7 +135,11 @@ fn handle_main_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
             // debug!("Skipped one packet in main inbound");
             continue;
         };
-        let host = Host::src_from_packet(&packet);
+        let host = if let Some(host) = Host::src_from_packet(&packet, data_link) {
+            host
+        } else {
+            continue;
+        };
         let states = STATES.get().unwrap().read();
         if states
             .get(&host)
@@ -146,6 +156,7 @@ fn handle_side_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
         .unwrap()
         .open_interface(netif)
         .expect("Cannot open interface");
+    let data_link = netif.data_link();
     netif
         .set_filter(SIDE_INBOUND_FILTER)
         .expect("Cannot set side filter");
@@ -167,7 +178,11 @@ fn handle_side_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
                 .lock()
                 .update_dst_hw_from_packet(&packet);
         } else {
-            let host = Host::src_from_packet(&packet);
+            let host = if let Some(host) = Host::src_from_packet(&packet, data_link) {
+                host
+            } else {
+                continue;
+            };
             let states = STATES.get().unwrap().read();
             if let Some(state) = states.get(&host) {
                 if State::Pending == *state.lock() {
