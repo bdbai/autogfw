@@ -5,18 +5,18 @@ Swith route automatically by realtime active detection.
 *Linux only*
 
 ## Usage
-Require root privilege for `ip route` commands.
-
 1. Ensure `libpcap` or `libpcap-dev` installed on your system.
 2. Run with the following command
 ```sh
 # Turn on debug logging
 export RUST_LOG=debug
+# Add privileges for raw packet processing
+sudo setcap cap_net_raw,cap_net_admin=eip ./autogfw
 # Start autogfw
-sudo -E ./autogfw -m enp4s0 -s enp4s1 -c via 10.10.1.1 dev enp4s1
+./autogfw -m enp4s0 -s enp4s1 -c via 10.10.1.1 dev enp4s1
 ```
 where:
-- `enp4s0` is the main network interface
+- `enp4s0` is the main network interface (ether datalink)
 - `enp4s1` is the backup network interface (through VPN)
 - `10.10.1.1` is the gateway address to use for the backup network interface
 
