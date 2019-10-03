@@ -38,6 +38,9 @@ struct Cli {
     /// Timeout (in seconds)
     #[structopt(short = "t", long = "timeout", default_value = "2")]
     timeout: u64,
+    /// Do not process inbound packets from main interface for debug purposes
+    #[structopt(short = "k", long = "skip-main")]
+    skip_main_inbound: bool,
     /// The arguments passed to  `ip route replace`.
     /// Will be appended to `ip route replace $ip_addr`.
     /// If not specified, routes will not be changed.
@@ -281,6 +284,7 @@ fn timer_handler(state_tx: Sender<StateArgs>, timer_rx: Receiver<TimerArgs>) {
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
     let opts = Cli::from_args();
+    let skip_main_inbound = opts.skip_main_inbound;
     let main_netif = opts.main_netif.to_string();
     let side_netif = opts.side_netif.to_string();
     if main_netif == side_netif {
@@ -312,15 +316,20 @@ fn main() {
             timer_tx1,
         )
     });
-    let main_netif_inbound_thread =
-        thread::spawn(move || handle_main_inbound_packets(main_netif2.as_str(), state_tx2));
+    let main_netif_inbound_thread = if skip_main_inbound {
+        None
+    } else {
+        Some(thread::spawn(move || {
+            handle_main_inbound_packets(main_netif2.as_str(), state_tx2)
+        }))
+    };
     let side_netif_thread =
         thread::spawn(move || handle_side_inbound_packets(side_netif2.as_str(), state_tx));
     let state_handler_thread = thread::spawn(move || state_handler(state_rx));
     let timer_handler_thread = thread::spawn(move || timer_handler(state_tx3, timer_rx));
     info!("Started autogfw");
     main_netif_outbound_thread.join().unwrap();
-    main_netif_inbound_thread.join().unwrap();
+    main_netif_inbound_thread.map(|t| t.join().unwrap());
     side_netif_thread.join().unwrap();
     state_handler_thread.join().unwrap();
     timer_handler_thread.join().unwrap();
