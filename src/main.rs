@@ -1,5 +1,4 @@
 mod host;
-mod mac;
 mod packet;
 mod state;
 
@@ -52,7 +51,7 @@ type TimerArgs = (Host, Instant);
 
 const MAIN_OUTBOUND_FILTER: &str = "ip or ip6";
 const MAIN_INBOUND_FILTER: &str = "ip or ip6";
-const SIDE_INBOUND_FILTER: &str = "ip or ip6 or arp";
+const SIDE_INBOUND_FILTER: &str = "ip or ip6";
 
 static OPT: OnceCell<Cli> = OnceCell::new();
 static STATES: OnceCell<RwLock<HashMap<Host, Mutex<state::State>>>> = OnceCell::new();
@@ -170,24 +169,15 @@ fn handle_side_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
             // debug!("Skipped one packet in main outbound");
             continue;
         };
-        if (packet[12], packet[13]) == (0x08, 0x06) {
-            // arp response
-            SIDE_SENDER
-                .get()
-                .unwrap()
-                .lock()
-                .update_dst_hw_from_packet(&packet);
+        let host = if let Some(host) = Host::src_from_packet(&packet, data_link) {
+            host
         } else {
-            let host = if let Some(host) = Host::src_from_packet(&packet, data_link) {
-                host
-            } else {
-                continue;
-            };
-            let states = STATES.get().unwrap().read();
-            if let Some(state) = states.get(&host) {
-                if State::Pending == *state.lock() {
-                    state_tx.send((host, State::KnownProxy)).unwrap();
-                }
+            continue;
+        };
+        let states = STATES.get().unwrap().read();
+        if let Some(state) = states.get(&host) {
+            if State::Pending == *state.lock() {
+                state_tx.send((host, State::KnownProxy)).unwrap();
             }
         }
     }

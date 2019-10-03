@@ -1,21 +1,26 @@
 use {
-    crate::mac::get_dst_address_by_netif_name,
     ipnetwork::IpNetwork,
+    libc::{c_int, c_void, setsockopt, strerror, IPPROTO_IPV6, SOL_SOCKET, SO_BINDTODEVICE},
+    log::warn,
     pnet::{
-        datalink::{channel, interfaces, Channel, DataLinkSender, MacAddr, NetworkInterface},
+        datalink::interfaces,
         packet::{
-            ethernet::{EtherType, EthernetPacket, MutableEthernetPacket},
+            ethernet::{EtherType, MutableEthernetPacket},
             ip::IpNextHeaderProtocol,
             ipv4::{checksum, MutableIpv4Packet},
             ipv6::MutableIpv6Packet,
             tcp::{self, MutableTcpPacket},
             udp::{self, MutableUdpPacket},
-            MutablePacket, Packet,
+            MutablePacket,
         },
+        transport::{transport_channel, TransportChannelType, TransportProtocol, TransportSender},
     },
     std::{
+        convert::TryInto,
+        ffi::{CStr, CString},
         io::Error,
-        net::{Ipv4Addr, Ipv6Addr},
+        mem::size_of,
+        net::{IpAddr, Ipv4Addr, Ipv6Addr},
     },
 };
 
@@ -23,16 +28,15 @@ const ETHER_TYPE_IPV4: u16 = 0x0800;
 const ETHER_TYPE_IPV6: u16 = 0x86DD;
 const TCP: u8 = 0x06;
 const UDP: u8 = 0x11;
+const IPV6_HDRINCL: c_int = 36;
 pub const IPV4_VERSION: u8 = 0x45;
 pub const IPV6_VERSION: u8 = 0x60; // higher 4 bits only
 
 pub struct PacketSender {
-    netif: NetworkInterface,
-    src_mac: Option<MacAddr>,
-    dst_mac: Option<MacAddr>,
     ipv4_addr: Option<Ipv4Addr>,
     ipv6_addr: Option<Ipv6Addr>,
-    channel: Option<Box<dyn DataLinkSender>>,
+    channel_v4: Option<TransportSender>,
+    channel_v6: Option<TransportSender>,
 }
 
 impl PacketSender {
@@ -70,12 +74,42 @@ impl PacketSender {
             _ => {}
         }
     }
+    unsafe fn check_errno(errno: c_int) -> Result<(), String> {
+        if errno != 0 {
+            return Err(
+                CStr::into_c_string(Box::from(CStr::from_ptr(strerror(errno))))
+                    .into_string()
+                    .unwrap(),
+            );
+        }
+        Ok(())
+    }
+    unsafe fn set_sockopts(netif: &str, socket_fd: c_int, is_ipv6: bool) -> Result<(), String> {
+        let netif_str = CString::new(netif).unwrap();
+        Self::check_errno(setsockopt(
+            socket_fd,
+            SOL_SOCKET,
+            SO_BINDTODEVICE,
+            netif_str.as_ptr() as *const c_void,
+            netif_str.as_bytes().len().try_into().unwrap(),
+        ))?;
+        if is_ipv6 {
+            let opt: c_int = 1;
+            Self::check_errno(setsockopt(
+                socket_fd,
+                IPPROTO_IPV6,
+                IPV6_HDRINCL,
+                &opt as *const c_int as *const c_void,
+                size_of::<c_int>().try_into().unwrap(),
+            ))?
+        }
+        Ok(())
+    }
     pub fn open(netif_name: &str) -> Result<Self, String> {
         let netif = interfaces()
             .into_iter()
             .find(|netif| netif.name == netif_name)
             .ok_or_else(|| "Cannot find network interface ".to_string() + netif_name)?;
-        let src_mac = netif.mac;
         let ipv4_addr = netif.ips.iter().find_map(|ip| {
             if let IpNetwork::V4(v4) = ip {
                 Some(v4.ip())
@@ -91,75 +125,61 @@ impl PacketSender {
             }
         });
         let mut ret = Self {
-            netif,
-            src_mac,
-            dst_mac: get_dst_address_by_netif_name(netif_name),
             ipv4_addr,
             ipv6_addr,
-            channel: None,
+            channel_v4: None,
+            channel_v6: None,
         };
-        let chan = match channel(&ret.netif, Default::default()).unwrap() {
-            Channel::Ethernet(tx, _rx) => tx,
-            _ => panic!("Unknown channel type"),
-        };
-        ret.channel = Some(chan);
+        let (tx, _rx) =
+            transport_channel(2048, TransportChannelType::Layer3(IpNextHeaderProtocol(4))) // IPv4 only
+                .expect("Cannot open send channel");
+        let socket = tx.socket.clone();
+        unsafe { Self::set_sockopts(netif_name, socket.fd, false)? }
+        ret.channel_v4 = Some(tx);
+        let (tx, _rx) = transport_channel(
+            2048,
+            TransportChannelType::Layer4(TransportProtocol::Ipv6(IpNextHeaderProtocol(4))),
+        )
+        .expect("Cannot open send channel");
+        let socket = tx.socket.clone();
+        unsafe { Self::set_sockopts(netif_name, socket.fd, true)? }
         Ok(ret)
     }
     pub fn send(&mut self, ether_packet: &[u8]) -> Result<(), Error> {
         let size = ether_packet.len();
-        if size < EthernetPacket::minimum_packet_size() {
+        if size < 20 {
             return Ok(());
         }
-        let src_mac = self.src_mac;
-        let dst_mac = self.dst_mac;
-        let ether_packet = EthernetPacket::new(ether_packet).unwrap();
         let ipv4_addr = self.ipv4_addr;
         let ipv6_addr = self.ipv6_addr;
-        self.channel
-            .as_mut()
-            .unwrap()
-            .build_and_send(1, src_mac.map_or(size - 14, |_| size), &mut |new_packet| {
-                let mut packet = new_packet;
-                let ether_type = if let (Some(src_mac), Some(dst_mac)) = (src_mac, dst_mac) {
-                    let mut new_ether_packet = MutableEthernetPacket::new(packet).unwrap();
-                    new_ether_packet.clone_from(&ether_packet);
-                    new_ether_packet.set_source(src_mac);
-                    new_ether_packet.set_destination(dst_mac);
-                    let ether_type = new_ether_packet.get_ethertype();
-                    packet = &mut packet[14..];
-                    ether_type
-                } else {
-                    packet.copy_from_slice(ether_packet.payload());
-                    match packet[0] {
-                        IPV4_VERSION => EtherType(ETHER_TYPE_IPV4),
-                        byte if byte & 0xF0 == IPV6_VERSION => EtherType(ETHER_TYPE_IPV6),
-                        _ => return,
-                    }
-                };
-                match (ether_type, ipv4_addr, ipv6_addr) {
-                    (EtherType(ETHER_TYPE_IPV4), Some(ipv4_addr), _) => {
-                        // IPV4
-                        let mut new_ip_packet = MutableIpv4Packet::new(packet).unwrap();
-                        new_ip_packet.set_source(ipv4_addr);
-                        let checksum = checksum(&new_ip_packet.to_immutable());
-                        new_ip_packet.set_checksum(checksum);
-                        Self::recalculate_ipv4_l4_checksum(&mut new_ip_packet);
-                    }
-                    (EtherType(ETHER_TYPE_IPV6), _, Some(ipv6_addr)) => {
-                        // IPV6
-                        let mut new_ip_packet = MutableIpv6Packet::new(packet).unwrap();
-                        new_ip_packet.set_source(ipv6_addr);
-                        Self::recalculate_ipv6_l4_checksum(&mut new_ip_packet);
-                    }
-                    _ => {}
-                }
-            })
-            .unwrap()
-    }
-
-    pub fn update_dst_hw_from_packet(&mut self, ether_packet: &[u8]) {
-        EthernetPacket::new(ether_packet).map(|ether_packet| {
-            self.dst_mac = Some(ether_packet.get_source());
-        });
+        let mut ether_packet = ether_packet.to_vec();
+        let mut ether_packet = MutableEthernetPacket::new(&mut ether_packet).unwrap();
+        match ether_packet.get_ethertype() {
+            EtherType(ETHER_TYPE_IPV4) => {
+                let mut new_ip_packet = MutableIpv4Packet::new(ether_packet.payload_mut()).unwrap();
+                new_ip_packet.set_source(ipv4_addr.unwrap());
+                let checksum = checksum(&new_ip_packet.to_immutable());
+                new_ip_packet.set_checksum(checksum);
+                Self::recalculate_ipv4_l4_checksum(&mut new_ip_packet);
+                let dest = IpAddr::V4(new_ip_packet.get_destination());
+                self.channel_v4
+                    .as_mut()
+                    .unwrap()
+                    .send_to(new_ip_packet, dest)
+                    .map(|_| ())
+            }
+            EtherType(ETHER_TYPE_IPV6) => {
+                let mut new_ip_packet = MutableIpv6Packet::new(ether_packet.payload_mut()).unwrap();
+                new_ip_packet.set_source(ipv6_addr.unwrap());
+                Self::recalculate_ipv6_l4_checksum(&mut new_ip_packet);
+                let dest = IpAddr::V6(new_ip_packet.get_destination());
+                self.channel_v6
+                    .as_mut()
+                    .unwrap()
+                    .send_to(new_ip_packet, dest)
+                    .map(|_| ())
+            }
+            _ => (warn!("Unknown ether type to send"), Ok(())).1,
+        }
     }
 }
