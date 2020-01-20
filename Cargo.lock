@@ -359,7 +359,7 @@ dependencies = [
 [[package]]
 name = "rawsock"
 version = "0.3.0"
-source = "git+https://github.com/bdbai/rust-rawsock.git#0bed41f6fe998012a125f5c2768909e94d50e008"
+source = "git+https://github.com/bdbai/rust-rawsock.git#547ed0c1931388172dafe9cc69c0fa9831721e4d"
 dependencies = [
  "bitflags 1.2.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "dlopen 0.1.8 (registry+https://github.com/rust-lang/crates.io-index)",
