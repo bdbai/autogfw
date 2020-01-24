@@ -1,24 +1,26 @@
-mod host;
 mod packet;
 mod state;
 
 use {
     env_logger::{self, Env},
+    libc::sockaddr_ll,
     log::{debug, error, info},
     once_cell::sync::OnceCell,
-    packet::PacketSender,
+    packet::{IpPacket, PacketSender, SendChannel},
     parking_lot::{Mutex, RwLock},
-    rawsock::{
-        self,
-        pcap::{self, Direction},
-        traits::DynamicInterface,
-        traits::Library,
+    pnet::{
+        datalink::linux::{channel as datalink_channel, Config},
+        datalink::{interfaces, Channel, ChannelType, NetworkInterface},
+        packet::{ipv4::Ipv4Packet, ipv6::Ipv6Packet, Packet, PacketSize},
     },
     state::State,
     std::{
+        cell::RefCell,
         collections::HashMap,
-        process::exit,
-        process::Command,
+        mem::zeroed,
+        net::IpAddr,
+        process::{exit, Command},
+        rc::Rc,
         str::from_utf8,
         sync::mpsc::{channel, Receiver, Sender},
         thread,
@@ -48,140 +50,101 @@ struct Cli {
     route_add_arguments: Option<Vec<String>>,
 }
 
-type Host = host::Host;
+type Host = IpAddr;
 type StateArgs = (Host, state::State);
 type TimerArgs = (Host, Instant);
 
-const MAIN_OUTBOUND_FILTER: &str = "ip or ip6";
-const MAIN_INBOUND_FILTER: &str = "ip or ip6";
-const SIDE_INBOUND_FILTER: &str = "ip or ip6";
-
+const PACKET_HOST: u8 = 0;
+const PACKET_OUTGOING: u8 = 4;
 static OPT: OnceCell<Cli> = OnceCell::new();
 static STATES: OnceCell<RwLock<HashMap<Host, Mutex<state::State>>>> = OnceCell::new();
 static SIDE_SENDER: OnceCell<Mutex<PacketSender>> = OnceCell::new();
-pub static LIB: OnceCell<pcap::Library> = OnceCell::new();
 
-fn handle_main_outbound_packets(
-    main_netif: &str,
-    side_netif: &str,
-    state_tx: Sender<StateArgs>,
-    timer_tx: Sender<TimerArgs>,
+fn handle_netif_packets(
+    netif: &NetworkInterface,
+    ether_type: u16,
+    mut on_inbound_v4_packet: impl FnMut(&[u8]),
+    mut on_inbound_v6_packet: impl FnMut(&[u8]),
+    mut on_outbound_v4_packet: impl FnMut(&[u8]),
+    mut on_outbound_v6_packet: impl FnMut(&[u8]),
 ) {
-    let lib = LIB.get().unwrap();
-    let mut main_netif = lib
-        .open_interface(main_netif)
-        .expect("Cannot open main interface");
-    let data_link = main_netif.data_link();
-    main_netif
-        .set_filter(MAIN_OUTBOUND_FILTER)
-        .expect("Cannot set main outbound filter");
-    main_netif
-        .set_direction(Direction::Out)
-        .expect("Cannot set main outbound direction");
-    SIDE_SENDER
-        .set(Mutex::new(
-            PacketSender::open(side_netif).expect("Cannot open side interface sender"),
-        ))
-        .map_err(|_| ())
-        .unwrap();
+    let sockaddr = Rc::new(RefCell::new(unsafe { zeroed() }));
+    let mut rx = match datalink_channel(
+        netif,
+        Config {
+            channel_type: ChannelType::Layer3(3),
+            recv_sockaddr_storage: Some(sockaddr.clone()),
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    {
+        Channel::Ethernet(_tx, rx) => rx,
+        _ => panic!("Unhandled ether type from pnet"),
+    };
     loop {
-        let packet = if let Ok(packet) = main_netif.receive() {
+        let packet = if let Ok(packet) = rx.next() {
             packet
         } else {
-            // debug!("Skipped one packet in main outbound");
             continue;
         };
-        let host = if let Some(host) = Host::dst_from_packet(&packet, data_link) {
-            host
-        } else {
-            continue;
+
+        // See https://linux.die.net/man/7/packet Address types
+        let pkttype = unsafe { *(sockaddr.as_ptr() as *const sockaddr_ll) }.sll_pkttype;
+        let header_half = packet[0] >> 4;
+        match (pkttype, header_half) {
+            (PACKET_HOST, 4) => on_inbound_v4_packet(packet),
+            (PACKET_HOST, 6) => on_inbound_v6_packet(packet),
+            (PACKET_OUTGOING, 4) => on_outbound_v4_packet(packet),
+            (PACKET_OUTGOING, 6) => on_outbound_v6_packet(packet),
+            _ => {}
         };
-        let states = STATES.get().unwrap().read();
-        if states.get(&host).is_none() {
-            state_tx.send((host, State::Pending)).unwrap();
-            assert!(
-                packet.len() >= 14,
-                "Packet length should be greater than 14 bytes"
-            );
-            let test_packet = packet.into_owned();
-            match SIDE_SENDER.get().unwrap().lock().send(&test_packet) {
-                Ok(()) => {
-                    timer_tx.send((host, Instant::now())).unwrap();
-                }
-                Err(e) => {
-                    state_tx.send((host, State::TimedOut)).unwrap();
-                    error!("Error sending test packet: {}", e);
-                }
+    }
+}
+
+fn handle_main_outbound_packet<'a, T: IpPacket + Packet + PacketSize + 'a>(
+    packet: T,
+    state_tx: &Sender<StateArgs>,
+    timer_tx: &Sender<TimerArgs>,
+) where
+    PacketSender: packet::SendChannel<'a, T>,
+{
+    let host = packet.get_destination();
+    let states = STATES.get().unwrap().read();
+    if states.get(&host).is_none() {
+        state_tx.send((host, State::Pending)).unwrap();
+        match SIDE_SENDER.get().unwrap().lock().send_packet(packet) {
+            Ok(()) => {
+                timer_tx.send((host, Instant::now())).unwrap();
+            }
+            Err(e) => {
+                state_tx.send((host, State::TimedOut)).unwrap();
+                error!("Error sending test packet: {}", e);
             }
         }
     }
 }
 
-fn handle_main_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
-    let mut netif = LIB
-        .get()
-        .unwrap()
-        .open_interface(netif)
-        .expect("Cannot open main interface");
-    let data_link = netif.data_link();
-    netif
-        .set_filter(MAIN_INBOUND_FILTER)
-        .expect("Cannot set main inbound filter");
-    netif
-        .set_direction(Direction::In)
-        .expect("Cannot set main inbound direction");
-    loop {
-        let packet = if let Ok(packet) = netif.receive() {
-            packet
-        } else {
-            // debug!("Skipped one packet in main inbound");
-            continue;
-        };
-        let host = if let Some(host) = Host::src_from_packet(&packet, data_link) {
-            host
-        } else {
-            continue;
-        };
-        let states = STATES.get().unwrap().read();
-        if states
-            .get(&host)
-            .map_or(true, |state| *state.lock() != State::KnownDirect)
-        {
-            state_tx.send((host, State::KnownDirect)).unwrap();
-        }
+fn handle_main_inbound_packet<'a>(packet: impl IpPacket + 'a, state_tx: &Sender<StateArgs>) {
+    if OPT.get().map(|o| o.skip_main_inbound).unwrap() {
+        return;
+    }
+    let host = packet.get_source();
+    let states = STATES.get().unwrap().read();
+    if states
+        .get(&host)
+        .map_or(true, |state| *state.lock() != State::KnownDirect)
+    {
+        state_tx.send((host, State::KnownDirect)).unwrap();
     }
 }
 
-fn handle_side_inbound_packets(netif: &str, state_tx: Sender<StateArgs>) {
-    let mut netif = LIB
-        .get()
-        .unwrap()
-        .open_interface(netif)
-        .expect("Cannot open interface");
-    let data_link = netif.data_link();
-    netif
-        .set_filter(SIDE_INBOUND_FILTER)
-        .expect("Cannot set side filter");
-    netif
-        .set_direction(Direction::In)
-        .expect("Cannot set side interface inbound direction");
-    loop {
-        let packet = if let Ok(packet) = netif.receive() {
-            packet
-        } else {
-            // debug!("Skipped one packet in main outbound");
-            continue;
-        };
-        let host = if let Some(host) = Host::src_from_packet(&packet, data_link) {
-            host
-        } else {
-            continue;
-        };
-        let states = STATES.get().unwrap().read();
-        if let Some(state) = states.get(&host) {
-            if State::Pending == *state.lock() {
-                state_tx.send((host, State::KnownProxy)).unwrap();
-            }
+fn handle_side_inbound_packets<'a>(packet: impl IpPacket + 'a, state_tx: &Sender<StateArgs>) {
+    let host = packet.get_source();
+    let states = STATES.get().unwrap().read();
+    if let Some(state) = states.get(&host) {
+        if State::Pending == *state.lock() {
+            state_tx.send((host, State::KnownProxy)).unwrap();
         }
     }
 }
@@ -265,7 +228,7 @@ fn state_handler(rx: Receiver<StateArgs>) {
     }
 }
 
-fn timer_handler(state_tx: Sender<StateArgs>, timer_rx: Receiver<TimerArgs>) {
+fn timer_handler(state_tx: &Sender<StateArgs>, timer_rx: Receiver<TimerArgs>) {
     let timeout = Duration::from_secs(OPT.get().unwrap().timeout as u64);
     for (port, fire_time) in timer_rx.into_iter() {
         timeout
@@ -284,53 +247,101 @@ fn timer_handler(state_tx: Sender<StateArgs>, timer_rx: Receiver<TimerArgs>) {
 fn main() {
     env_logger::init_from_env(Env::default().default_filter_or("info"));
     let opts = Cli::from_args();
-    let skip_main_inbound = opts.skip_main_inbound;
-    let main_netif = opts.main_netif.to_string();
-    let side_netif = opts.side_netif.to_string();
-    if main_netif == side_netif {
+    if opts.main_netif == opts.side_netif {
         error!("Main interface cannot be the same as the side interface");
         exit(1);
     }
-    let main_netif2 = main_netif.clone();
-    let side_netif2 = side_netif.clone();
-    OPT.set(opts).map_err(|_| ()).unwrap();
+    let skip_main_inbound = opts.skip_main_inbound;
     STATES
         .set(RwLock::new(HashMap::with_capacity(1024)))
         .unwrap();
 
-    LIB.set(pcap::Library::open_default_paths().expect("Cannot open pcap lib"))
+    let interfaces = interfaces();
+    let main_netif = interfaces
+        .iter()
+        .find(|i| i.name == opts.main_netif)
+        .expect("No such main interface")
+        .clone();
+    let side_netif = interfaces
+        .iter()
+        .find(|i| i.name == opts.side_netif)
+        .expect("No such side interface")
+        .clone();
+    SIDE_SENDER
+        .set(Mutex::new(PacketSender::open(&opts.side_netif).unwrap()))
         .map_err(|_| ())
         .unwrap();
-    info!("Open pcap lib successfully");
+    OPT.set(opts).map_err(|_| ()).unwrap();
     let (state_tx, state_rx) = channel();
     let (timer_tx, timer_rx) = channel();
-    let state_tx1 = state_tx.clone();
-    let state_tx2 = state_tx.clone();
-    let state_tx3 = state_tx.clone();
-    let timer_tx1 = timer_tx.clone();
-    let main_netif_outbound_thread = thread::spawn(move || {
-        handle_main_outbound_packets(
-            main_netif.as_str(),
-            side_netif.as_str(),
-            state_tx1,
-            timer_tx1,
-        )
-    });
-    let main_netif_inbound_thread = if skip_main_inbound {
-        None
-    } else {
-        Some(thread::spawn(move || {
-            handle_main_inbound_packets(main_netif2.as_str(), state_tx2)
-        }))
+
+    let main_netif_ipv4_thread = {
+        let netif = main_netif.clone();
+        let state_tx = state_tx.clone();
+        let timer_tx = timer_tx.clone();
+        thread::spawn(move || {
+            if skip_main_inbound {
+                handle_netif_packets(
+                    &netif,
+                    Ipv4Packet::ether_type(),
+                    |_| {},
+                    |_| {},
+                    |packet| {
+                        Ipv4Packet::new(packet)
+                            .map(|p| handle_main_outbound_packet(p, &state_tx, &timer_tx));
+                    },
+                    |packet| {
+                        Ipv6Packet::new(packet)
+                            .map(|p| handle_main_outbound_packet(p, &state_tx, &timer_tx));
+                    },
+                );
+            } else {
+                handle_netif_packets(
+                    &netif,
+                    Ipv4Packet::ether_type(),
+                    |packet| {
+                        Ipv4Packet::new(packet).map(|p| handle_main_inbound_packet(p, &state_tx));
+                    },
+                    |packet| {
+                        Ipv6Packet::new(packet).map(|p| handle_main_inbound_packet(p, &state_tx));
+                    },
+                    |packet| {
+                        Ipv4Packet::new(packet)
+                            .map(|p| handle_main_outbound_packet(p, &state_tx, &timer_tx));
+                    },
+                    |packet| {
+                        Ipv6Packet::new(packet)
+                            .map(|p| handle_main_outbound_packet(p, &state_tx, &timer_tx));
+                    },
+                )
+            }
+        })
     };
-    let side_netif_thread =
-        thread::spawn(move || handle_side_inbound_packets(side_netif2.as_str(), state_tx));
+    let side_netif_ipv4_thread = {
+        let netif = side_netif.clone();
+        let state_tx = state_tx.clone();
+        thread::spawn(move || {
+            handle_netif_packets(
+                &netif,
+                Ipv4Packet::ether_type(),
+                |packet| {
+                    Ipv4Packet::new(packet).map(|p| handle_side_inbound_packets(p, &state_tx));
+                },
+                |packet| {
+                    Ipv6Packet::new(packet).map(|p| handle_side_inbound_packets(p, &state_tx));
+                },
+                |_| {},
+                |_| {},
+            )
+        })
+    };
     let state_handler_thread = thread::spawn(move || state_handler(state_rx));
-    let timer_handler_thread = thread::spawn(move || timer_handler(state_tx3, timer_rx));
+    let timer_handler_thread = thread::spawn(move || timer_handler(&state_tx, timer_rx));
+
     info!("Started autogfw");
-    main_netif_outbound_thread.join().unwrap();
-    main_netif_inbound_thread.map(|t| t.join().unwrap());
-    side_netif_thread.join().unwrap();
+
+    main_netif_ipv4_thread.join().unwrap();
+    side_netif_ipv4_thread.join().unwrap();
     state_handler_thread.join().unwrap();
     timer_handler_thread.join().unwrap();
 }

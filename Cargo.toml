@@ -12,9 +12,9 @@ env_logger = "0.7.0"
 once_cell = "1.2.0"
 structopt = { version = "0.3.2", default_features = false }
 parking_lot = "0.9.0"
-pnet = { version = "0.25.0", default_features = false }
 ipnetwork = "0.15.1"
 libc = "0.2.66"
 
-[dependencies.rawsock]
-git = "https://github.com/bdbai/rust-rawsock.git"
+[dependencies.pnet]
+git = "https://github.com/bdbai/libpnet"
+default_features = false
