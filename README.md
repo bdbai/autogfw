@@ -5,8 +5,7 @@ Swith route automatically by realtime active detection.
 *Linux only*
 
 ## Usage
-1. Ensure `libpcap` or `libpcap-dev` installed on your system.
-2. Run with the following command
+1. Run with the following command
 ```sh
 # Turn on debug logging
 export RUST_LOG=debug
@@ -24,5 +23,5 @@ See `./autogfw --help` for more information.
 
 ## Build
 1. Ensure `rustup` is installed on your system. See https://rustup.rs
-2. Install nightly (2019-09-21) toolchain with `rustup install nightly-2019-09-21`
+2. Install nightly (2020-01-08) toolchain with `rustup install nightly-2020-01-08`
 3. `cargo build --release`
