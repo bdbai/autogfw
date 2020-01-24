@@ -4,6 +4,7 @@ use {
         c_int, c_void, setsockopt, strerror, ETH_P_IP, ETH_P_IPV6, IPPROTO_IPV6, SOL_SOCKET,
         SO_BINDTODEVICE,
     },
+    log::info,
     pnet::{
         datalink::interfaces,
         packet::{
@@ -147,6 +148,11 @@ impl PacketSender {
                 None
             }
         });
+        if let Some(ipv4_addr) = ipv4_addr {
+            info!("Got IPv4 address from side interface: {:?}", ipv4_addr);
+        } else {
+            info!("IPv4 Address is not available from side interface");
+        }
         let ipv6_addr = netif.ips.iter().find_map(|ip| {
             if let IpNetwork::V6(v6) = ip {
                 Some(v6.ip())
@@ -154,6 +160,11 @@ impl PacketSender {
                 None
             }
         });
+        if let Some(ipv6_addr) = ipv6_addr {
+            info!("Got IPv6 address from side interface: {:?}", ipv6_addr);
+        } else {
+            info!("IPv6 Address is not available from side interface");
+        }
         let mut ret = Self {
             ipv4_addr,
             ipv6_addr,
@@ -162,22 +173,26 @@ impl PacketSender {
         };
 
         // IPv4 outbound
-        let (tx, _rx) =
-            transport_channel(2048, TransportChannelType::Layer3(IpNextHeaderProtocol(4))) // IPv4 only
-                .expect("Cannot open send channel");
-        let socket = tx.socket.clone();
-        unsafe { Self::set_sockopts(netif_name, socket.fd, false)? }
-        ret.send_channel_v4 = Some(tx);
+        if ipv4_addr.is_some() {
+            let (tx, _rx) =
+                transport_channel(2048, TransportChannelType::Layer3(IpNextHeaderProtocol(4))) // IPv4 only
+                    .expect("Cannot open send channel");
+            let socket = tx.socket.clone();
+            unsafe { Self::set_sockopts(netif_name, socket.fd, false)? }
+            ret.send_channel_v4 = Some(tx);
+        }
 
         // IPv6 outbound
-        let (tx, _rx) = transport_channel(
-            2048,
-            TransportChannelType::Layer4(TransportProtocol::Ipv6(IpNextHeaderProtocol(41))),
-        )
-        .expect("Cannot open send channel");
-        let socket = tx.socket.clone();
-        unsafe { Self::set_sockopts(netif_name, socket.fd, true)? }
-        ret.send_channel_v6 = Some(tx);
+        if ipv6_addr.is_some() {
+            let (tx, _rx) = transport_channel(
+                2048,
+                TransportChannelType::Layer4(TransportProtocol::Ipv6(IpNextHeaderProtocol(41))),
+            )
+            .expect("Cannot open send channel");
+            let socket = tx.socket.clone();
+            unsafe { Self::set_sockopts(netif_name, socket.fd, true)? }
+            ret.send_channel_v6 = Some(tx);
+        }
 
         Ok(ret)
     }
@@ -185,10 +200,14 @@ impl PacketSender {
         &mut self,
         main_out_packet: T,
     ) -> Result<(), Error> {
-        let ipv4_addr = self.ipv4_addr;
+        let ipv4_addr = if let Some(ipv4_addr) = self.ipv4_addr {
+            ipv4_addr
+        } else {
+            return Ok(());
+        };
         let mut new_ip_packet =
             MutableIpv4Packet::owned(main_out_packet.packet().to_vec()).unwrap();
-        new_ip_packet.set_source(ipv4_addr.unwrap());
+        new_ip_packet.set_source(ipv4_addr);
         let checksum = checksum(&new_ip_packet.to_immutable());
         new_ip_packet.set_checksum(checksum);
         Self::recalculate_ipv4_l4_checksum(&mut new_ip_packet);
@@ -203,10 +222,14 @@ impl PacketSender {
         &mut self,
         main_out_packet: T,
     ) -> Result<(), Error> {
-        let ipv4_addr = self.ipv6_addr;
+        let src_addr = if let Some(ipv6_addr) = self.ipv6_addr {
+            ipv6_addr
+        } else {
+            return Ok(());
+        };
         let mut new_ip_packet =
             MutableIpv6Packet::owned(main_out_packet.packet().to_vec()).unwrap();
-        new_ip_packet.set_source(ipv4_addr.unwrap());
+        new_ip_packet.set_source(src_addr);
         Self::recalculate_ipv6_l4_checksum(&mut new_ip_packet);
         let dest = IpAddr::V6(new_ip_packet.get_destination());
         self.send_channel_v6

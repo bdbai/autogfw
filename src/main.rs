@@ -62,7 +62,6 @@ static SIDE_SENDER: OnceCell<Mutex<PacketSender>> = OnceCell::new();
 
 fn handle_netif_packets(
     netif: &NetworkInterface,
-    ether_type: u16,
     mut on_inbound_v4_packet: impl FnMut(&[u8]),
     mut on_inbound_v6_packet: impl FnMut(&[u8]),
     mut on_outbound_v4_packet: impl FnMut(&[u8]),
@@ -275,7 +274,7 @@ fn main() {
     let (state_tx, state_rx) = channel();
     let (timer_tx, timer_rx) = channel();
 
-    let main_netif_ipv4_thread = {
+    let main_netif_thread = {
         let netif = main_netif.clone();
         let state_tx = state_tx.clone();
         let timer_tx = timer_tx.clone();
@@ -283,7 +282,6 @@ fn main() {
             if skip_main_inbound {
                 handle_netif_packets(
                     &netif,
-                    Ipv4Packet::ether_type(),
                     |_| {},
                     |_| {},
                     |packet| {
@@ -298,7 +296,6 @@ fn main() {
             } else {
                 handle_netif_packets(
                     &netif,
-                    Ipv4Packet::ether_type(),
                     |packet| {
                         Ipv4Packet::new(packet).map(|p| handle_main_inbound_packet(p, &state_tx));
                     },
@@ -317,13 +314,12 @@ fn main() {
             }
         })
     };
-    let side_netif_ipv4_thread = {
+    let side_netif_thread = {
         let netif = side_netif.clone();
         let state_tx = state_tx.clone();
         thread::spawn(move || {
             handle_netif_packets(
                 &netif,
-                Ipv4Packet::ether_type(),
                 |packet| {
                     Ipv4Packet::new(packet).map(|p| handle_side_inbound_packets(p, &state_tx));
                 },
@@ -340,8 +336,8 @@ fn main() {
 
     info!("Started autogfw");
 
-    main_netif_ipv4_thread.join().unwrap();
-    side_netif_ipv4_thread.join().unwrap();
+    main_netif_thread.join().unwrap();
+    side_netif_thread.join().unwrap();
     state_handler_thread.join().unwrap();
     timer_handler_thread.join().unwrap();
 }
